@@ -234,6 +234,31 @@ static ALWAYS_INLINE void store32(uint8_t *at, uint32_t value) {
     memcpy(at, &value, 4);
 }
 
+static ALWAYS_INLINE uint16_t load16(const uint8_t *at) {
+    uint16_t value;
+    memcpy(&value, at, 2);
+    return value;
+}
+
+static ALWAYS_INLINE void store16(uint8_t *at, uint16_t value) {
+    memcpy(at, &value, 2);
+}
+
+/* a load or store at a register plus a constant, through a span one look
+   at the page tables gave for it and others off the same register, delta
+   bytes in, or the usual way where the look found no page the code reaches.
+   the code takes the look where the register has the value they share, in
+   a stretch the host takes no pages from, see docs/interface.md */
+#define SPAN_READ8(span, delta, address) (LIKELY(span) ? (span)[delta] : mem_read8(ctx, (address)))
+#define SPAN_READ16(span, delta, address) (LIKELY(span) ? load16((span) + (delta)) : mem_read16(ctx, (address)))
+#define SPAN_READ32(span, delta, address) (LIKELY(span) ? load32((span) + (delta)) : mem_read32(ctx, (address)))
+#define SPAN_WRITE8(span, delta, address, value) do { \
+    if (LIKELY(span)) (span)[delta] = (value); else mem_write8(ctx, (address), (value)); } while (0)
+#define SPAN_WRITE16(span, delta, address, value) do { \
+    if (LIKELY(span)) store16((span) + (delta), (value)); else mem_write16(ctx, (address), (value)); } while (0)
+#define SPAN_WRITE32(span, delta, address, value) do { \
+    if (LIKELY(span)) store32((span) + (delta), (value)); else mem_write32(ctx, (address), (value)); } while (0)
+
 #define C_EQ (ctx->z)
 #define C_NE (!ctx->z)
 #define C_CS (ctx->c)

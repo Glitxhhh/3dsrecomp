@@ -4,6 +4,7 @@
 
 use std::fmt::Write;
 
+use super::hoist::{read, write};
 use super::{Scope, call, jump, vfp, words};
 
 macro_rules! emit {
@@ -296,10 +297,17 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     };
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
+    let size = if byte { 1 } else { 4 };
+    // at the base plus a constant, which a span off the base can cover
+    let covered = if op & (1 << 25) == 0 && rn != 15 {
+        let offset = if !pre { 0 } else if sign == '+' { (op & 0xFFF) as i32 } else { -((op & 0xFFF) as i32) };
+        scope.access(a, rn, offset, size, !load)
+    } else {
+        None
+    };
     emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(scope, rn, a + 8));
     if load {
-        let read = if byte { "mem_read8" } else { "mem_read32" };
-        emit!(out, "    uint32_t v = {read}(ctx, {address});");
+        emit!(out, "    uint32_t v = {};", read(covered, size, address));
         if writeback && rn != rd {
             emit!(out, "    ctx->r[{rn}] = oa;");
         }
@@ -313,11 +321,8 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     } else {
         // storing r15 stores the address plus 12
         let value = if rd == 15 { scope.at(a + 12) } else { format!("ctx->r[{rd}]") };
-        if byte {
-            emit!(out, "    mem_write8(ctx, {address}, (uint8_t){value});");
-        } else {
-            emit!(out, "    mem_write32(ctx, {address}, {value});");
-        }
+        let value = if byte { format!("(uint8_t){value}") } else { value };
+        emit!(out, "    {};", write(covered, size, address, &value));
         if writeback {
             emit!(out, "    ctx->r[{rn}] = oa;");
         }
@@ -346,30 +351,51 @@ fn extra_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
     let back = if writeback { format!(" ctx->r[{rn}] = oa;") } else { String::new() };
+    // what a span off the base can cover, at the base plus a constant
+    let constant = op & (1 << 22) != 0 && rn != 15;
+    let at = if !pre {
+        0
+    } else {
+        let immediate = (((op >> 4) & 0xF0) | (op & 0xF)) as i32;
+        if sign == '+' { immediate } else { -immediate }
+    };
+    let access = |offset: i32, size: u32, write: bool| if constant { scope.access(a, rn, at + offset, size, write) } else { None };
     emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(scope, rn, a + 8));
     match (kind, load) {
-        (1, true) => emit!(out, "    uint32_t v = mem_read16(ctx, {address});{back} ctx->r[{rd}] = v; }}"),
+        (1, true) => {
+            emit!(out, "    uint32_t v = {};{back} ctx->r[{rd}] = v; }}", read(access(0, 2, false), 2, address))
+        }
         (1, false) => {
-            emit!(out, "    mem_write16(ctx, {address}, (uint16_t){});{back} }}", reg(scope, rd, a + 8))
+            let value = format!("(uint16_t){}", reg(scope, rd, a + 8));
+            emit!(out, "    {};{back} }}", write(access(0, 2, true), 2, address, &value))
         }
         (2, true) => emit!(
             out,
-            "    uint32_t v = (uint32_t)(int32_t)(int8_t)mem_read8(ctx, {address});{back} ctx->r[{rd}] = v; }}"
+            "    uint32_t v = (uint32_t)(int32_t)(int8_t){};{back} ctx->r[{rd}] = v; }}",
+            read(access(0, 1, false), 1, address)
         ),
-        (2, false) => emit!(
-            out,
-            "    uint32_t lo = mem_read32(ctx, {address}), hi = mem_read32(ctx, {address} + 4);{back} ctx->r[{rd}] = lo; ctx->r[{}] = hi; }}",
-            rd + 1
-        ),
+        (2, false) => {
+            let (low, high) = (access(0, 4, false), access(4, 4, false));
+            let next = format!("{address} + 4");
+            emit!(
+                out,
+                "    uint32_t lo = {}, hi = {};{back} ctx->r[{rd}] = lo; ctx->r[{}] = hi; }}",
+                read(low, 4, address),
+                read(high, 4, &next),
+                rd + 1
+            )
+        }
         (_, true) => emit!(
             out,
-            "    uint32_t v = (uint32_t)(int32_t)(int16_t)mem_read16(ctx, {address});{back} ctx->r[{rd}] = v; }}"
+            "    uint32_t v = (uint32_t)(int32_t)(int16_t){};{back} ctx->r[{rd}] = v; }}",
+            read(access(0, 2, false), 2, address)
         ),
-        (_, false) => emit!(
-            out,
-            "    mem_write32(ctx, {address}, ctx->r[{rd}]); mem_write32(ctx, {address} + 4, ctx->r[{}]);{back} }}",
-            rd + 1
-        ),
+        (_, false) => {
+            let (low, high) = (access(0, 4, true), access(4, 4, true));
+            let next = format!("{address} + 4");
+            let (first, second) = (format!("ctx->r[{rd}]"), format!("ctx->r[{}]", rd + 1));
+            emit!(out, "    {}; {};{back} }}", write(low, 4, address, &first), write(high, 4, &next, &second))
+        }
     }
     true
 }

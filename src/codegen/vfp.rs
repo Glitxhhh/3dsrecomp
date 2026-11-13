@@ -4,6 +4,7 @@
 
 use std::fmt::Write;
 
+use super::hoist::{Covered, read, write};
 use super::{Scope, words};
 
 macro_rules! emit {
@@ -240,7 +241,26 @@ pub fn load_store(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         .flat_map(|i| if double { vec![(first + i) * 2, (first + i) * 2 + 1] } else { vec![first + i] })
         .map(|word| format!("ctx->vfp[{}]", word & 31))
         .collect();
-    words(out, load, &registers);
+    // vldr and vstr, at the base plus a constant, which spans off the base
+    // can cover, a word at a time
+    let covered: Vec<Option<Covered>> = if pre && !writeback && rn != 15 {
+        let at = if up { offset as i32 } else { -(offset as i32) };
+        (0..registers.len()).map(|i| scope.access(a, rn, at + 4 * i as i32, 4, !load)).collect()
+    } else {
+        Vec::new()
+    };
+    if covered.iter().any(Option::is_some) {
+        for (i, (register, covered)) in registers.iter().zip(covered).enumerate() {
+            let address = format!("p + {}u", 4 * i);
+            if load {
+                emit!(out, "    {register} = {};", read(covered, 4, &address));
+            } else {
+                emit!(out, "    {};", write(covered, 4, &address, register));
+            }
+        }
+    } else {
+        words(out, load, &registers);
+    }
     if writeback {
         let sign = if up { '+' } else { '-' };
         emit!(out, "    ctx->r[{rn}] = base {sign} 0x{offset:X}u;");

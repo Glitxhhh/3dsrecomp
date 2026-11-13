@@ -7,6 +7,7 @@
 //! the host, which picks up again from r15.
 
 mod arm;
+mod hoist;
 mod locals;
 mod thumb;
 mod vfp;
@@ -34,6 +35,10 @@ pub(crate) struct Scope<'a> {
     /// the instructions left to the interpreter, which can end the code's
     /// run, so that it gets entered again right after them.
     pub interpreted: &'a std::cell::RefCell<Vec<u32>>,
+    /// the loads and stores at a register plus a constant so far.
+    pub accesses: &'a std::cell::RefCell<Vec<hoist::Access>>,
+    /// the looks at the page tables they share, once worked out.
+    pub plan: Option<&'a hoist::Plan>,
 }
 
 impl Scope<'_> {
@@ -45,6 +50,15 @@ impl Scope<'_> {
     /// the C function that runs the function at target, if there is one.
     fn function(&self, target: u32, thumb: bool) -> Option<String> {
         self.functions.get(&(target | thumb as u32)).cloned()
+    }
+
+    /// notes a load or store the instruction at makes at a register plus a
+    /// constant, and gives the span covering it, when one does.
+    fn access(&self, at: u32, base: u32, offset: i32, size: u32, write: bool) -> Option<hoist::Covered> {
+        let mut accesses = self.accesses.borrow_mut();
+        let ordinal = accesses.iter().rev().take_while(|access| access.at == at).count();
+        accesses.push(hoist::Access { at, base, offset, size, write });
+        self.plan.and_then(|plan| plan.covered.get(&(at, ordinal)).cloned())
     }
 }
 
@@ -277,10 +291,23 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             // written once to see what goes to the interpreter, the code
             // can stop after any of those, and then again with a label
             // after each, where the host comes back in
+            // along with the loads and stores, and where each instruction's
+            // C is, which the looks at the page tables they can share come
+            // from
             let interpreted = std::cell::RefCell::new(Vec::new());
+            let accesses = std::cell::RefCell::new(Vec::new());
             let relative = unit.module.is_some();
-            let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut String::new(), unit.program, &scope, entry, function, number);
+            let scope = Scope {
+                labels: &function.labels,
+                functions: &names,
+                prefix: &prefix,
+                relative,
+                interpreted: &interpreted,
+                accesses: &accesses,
+                plan: None,
+            };
+            let (mut body, mut pieces) = (String::new(), Vec::new());
+            write_body(&mut body, unit.program, &scope, entry, function, number, Some(&mut pieces));
             let mut resumable = (*function).clone();
             for address in interpreted.take() {
                 let at = function.instructions.iter().position(|&a| a == address);
@@ -288,7 +315,17 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                     resumable.labels.insert(next);
                 }
             }
-            let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
+            let lowered: Vec<(u32, &str)> = pieces.iter().map(|(at, range)| (*at, &body[range.clone()])).collect();
+            let plan = hoist::plan(&resumable.labels, &lowered, &accesses.take());
+            let scope = Scope {
+                labels: &resumable.labels,
+                functions: &names,
+                prefix: &prefix,
+                relative,
+                interpreted: &interpreted,
+                accesses: &accesses,
+                plan: Some(&plan),
+            };
             write_function(&mut source, unit.program, &scope, entry, &resumable, number);
             resumed.insert(entry, resumable.labels);
             size += function.instructions.len();
@@ -476,15 +513,24 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
     let thumb = function.mode == Mode::Thumb;
     emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
     let mut body = String::new();
-    write_body(&mut body, program, scope, entry, function, number);
+    write_body(&mut body, program, scope, entry, function, number, None);
     out.push_str(&locals::keep(&body));
     emit!(out, "}}");
     out.push_str(locals::RESET);
     out.push('\n');
 }
 
-/// what a function does, between its braces.
-fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
+/// what a function does, between its braces, noting where each
+/// instruction's C is in it when pieces is given.
+fn write_body(
+    out: &mut String,
+    program: &Program,
+    scope: &Scope,
+    entry: u32,
+    function: &Function,
+    number: usize,
+    mut pieces: Option<&mut Vec<(u32, std::ops::Range<usize>)>>,
+) {
     let thumb = function.mode == Mode::Thumb;
     let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
     if scope.relative {
@@ -520,23 +566,38 @@ fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, fu
             emit!(out, "L_{address:08X}:");
             emit!(out, "    BLOCK({}, {run});", scope.at(address));
         }
+        let start = out.len();
         let (continues, size) = if thumb {
             let op = program.text.read16(address).unwrap_or(0) as u32;
             let second = program.text.read16(address + 2).unwrap_or(0) as u32;
             let size = crate::thumb::decode(op as u16, Some(second as u16), address).1;
             emit!(out, "    /* {address:08X} {op:04X} */");
+            take_spans(out, scope, address);
             (thumb::lower(out, scope, address, op, second), size)
         } else {
             let op = program.text.read32(address).unwrap_or(0);
             emit!(out, "    /* {address:08X} {op:08X} */");
+            // before the condition, which may skip the instruction, but not
+            // the ones after it that use the span too
+            take_spans(out, scope, address);
             (arm::lower(out, scope, address, op), 4)
         };
+        if let Some(pieces) = pieces.as_mut() {
+            pieces.push((address, start..out.len()));
+        }
         let next = address + size;
         if continues && instructions.get(i + 1) != Some(&next) {
             emit!(out, "    target = {}; goto dispatch;", scope.at(next));
         }
     }
     emit!(out, "    OUT_OF_BUDGET();");
+}
+
+/// the looks at the page tables to take before the instruction at address.
+fn take_spans(out: &mut String, scope: &Scope, address: u32) {
+    for span in scope.plan.and_then(|plan| plan.before.get(&address)).into_iter().flatten() {
+        emit!(out, "{}", hoist::take(span));
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +639,25 @@ mod tests {
         assert!(code.contains("RETURN_TO_A(next);"));
 
         compiles("transfers", &files, &["code000.c"]);
+    }
+
+    /// two loads and two stores off r4 take one look each way, before the
+    /// first of them, and go through the spans, delta bytes in.
+    #[test]
+    fn accesses_off_one_register_share_a_look() {
+        // ldr r0, [r4, #4], ldr r1, [r4, #8], str r0, [r4, #12],
+        // strh r1, [r4, #16], bx lr
+        let files = files(&[0xE594_0004, 0xE594_1008, 0xE584_000C, 0xE1C4_11B0, 0xE12F_FF1E], &[]);
+        let code = &files["code000.c"];
+        let read = code.find("const uint8_t *hs0_ = mem_read_span(ctx, reg4_ + 0x4u, 8u);").expect("a look for the loads");
+        let write = code.find("uint8_t *hs1_ = mem_write_span(ctx, reg4_ + 0xCu, 6u);").expect("a look for the stores");
+        let first = code.find("SPAN_READ32(hs0_, 0, oa)").expect("the first load through it");
+        assert!(read < first && write < first);
+        assert!(code.contains("SPAN_READ32(hs0_, 4, oa)"));
+        assert!(code.contains("SPAN_WRITE32(hs1_, 0, oa, reg0_)"));
+        assert!(code.contains("SPAN_WRITE16(hs1_, 4, oa, (uint16_t)reg1_)"));
+
+        compiles("hoist", &files, &["code000.c"]);
     }
 
     /// the code goes on after an svc, which the host ran, into the next

@@ -58,7 +58,8 @@ can also run code made for 4, which never calls `svc`.
 more. Generation 3 added `recomp_origins`, generation 4, made for version 5
 of the interface, runs svcs in place, and generation 5 divides on the host.
 A library of an older generation, or one without the symbol, still runs.
-Building it again brings the improvements, which a host can suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
+Building it again brings the improvements, which a host can suggest. In Rust,
+`Library::generation` reads it, 0 when it is missing, and
 `recomp_abi::GENERATION` is the current one.
 
 ### Entries
@@ -245,6 +246,14 @@ where the host has to see the access:
 - I/O;
 - memory the host watches for changes, such as textures or command lists;
 - memory that is not mapped.
+
+The code looks a page up once for several loads or stores at the same
+register plus a constant. It keeps what it found until the register
+changes, the code reaches a label, or it calls the host for anything but
+memory. Inside the memory callbacks the host may fill entries in, such as a
+page it watched that has just been written, but it must not empty an entry
+or point it elsewhere. That waits until `interpret`, `lookup` or `svc`, or
+until the code returns.
 
 ## Host callbacks
 

@@ -3,6 +3,7 @@
 
 use std::fmt::Write;
 
+use super::hoist::{read, write};
 use super::{Scope, call, jump, words};
 
 macro_rules! emit {
@@ -49,24 +50,30 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
         }
         0b010 if op & (1 << 10) != 0 => high_register(out, scope, a, op),
         0b010 => alu(out, op),
-        0b011 => immediate_offset(out, op),
+        0b011 => immediate_offset(out, scope, a, op),
         0b100 if op & (1 << 12) != 0 => {
             let rd = (op >> 8) & 7;
-            let address = format!("ctx->r[13] + 0x{:X}u", (op & 0xFF) * 4);
-            if op & (1 << 11) != 0 {
-                emit!(out, "    ctx->r[{rd}] = mem_read32(ctx, {address});");
+            let offset = (op & 0xFF) * 4;
+            let address = format!("ctx->r[13] + 0x{offset:X}u");
+            let load = op & (1 << 11) != 0;
+            let covered = scope.access(a, 13, offset as i32, 4, !load);
+            if load {
+                emit!(out, "    ctx->r[{rd}] = {};", read(covered, 4, &address));
             } else {
-                emit!(out, "    mem_write32(ctx, {address}, ctx->r[{rd}]);");
+                emit!(out, "    {};", write(covered, 4, &address, &format!("ctx->r[{rd}]")));
             }
             true
         }
         0b100 => {
             let (rd, rb) = (op & 7, (op >> 3) & 7);
-            let address = format!("ctx->r[{rb}] + 0x{:X}u", ((op >> 6) & 0x1F) * 2);
-            if op & (1 << 11) != 0 {
-                emit!(out, "    ctx->r[{rd}] = mem_read16(ctx, {address});");
+            let offset = ((op >> 6) & 0x1F) * 2;
+            let address = format!("ctx->r[{rb}] + 0x{offset:X}u");
+            let load = op & (1 << 11) != 0;
+            let covered = scope.access(a, rb, offset as i32, 2, !load);
+            if load {
+                emit!(out, "    ctx->r[{rd}] = {};", read(covered, 2, &address));
             } else {
-                emit!(out, "    mem_write16(ctx, {address}, (uint16_t)ctx->r[{rd}]);");
+                emit!(out, "    {};", write(covered, 2, &address, &format!("(uint16_t)ctx->r[{rd}]")));
             }
             true
         }
@@ -247,16 +254,20 @@ fn register_offset(out: &mut String, op: u32) -> bool {
 }
 
 /// ldr, str, ldrb and strb with an immediate offset.
-fn immediate_offset(out: &mut String, op: u32) -> bool {
+fn immediate_offset(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = op & 7;
+    let rb = (op >> 3) & 7;
     let byte = op & (1 << 12) != 0;
-    let offset = ((op >> 6) & 0x1F) * if byte { 1 } else { 4 };
-    let address = format!("ctx->r[{}] + 0x{offset:X}u", (op >> 3) & 7);
-    match (op & (1 << 11) != 0, byte) {
-        (true, false) => emit!(out, "    ctx->r[{rd}] = mem_read32(ctx, {address});"),
-        (true, true) => emit!(out, "    ctx->r[{rd}] = mem_read8(ctx, {address});"),
-        (false, false) => emit!(out, "    mem_write32(ctx, {address}, ctx->r[{rd}]);"),
-        (false, true) => emit!(out, "    mem_write8(ctx, {address}, (uint8_t)ctx->r[{rd}]);"),
+    let size = if byte { 1 } else { 4 };
+    let offset = ((op >> 6) & 0x1F) * size;
+    let address = format!("ctx->r[{rb}] + 0x{offset:X}u");
+    let load = op & (1 << 11) != 0;
+    let covered = scope.access(a, rb, offset as i32, size, !load);
+    if load {
+        emit!(out, "    ctx->r[{rd}] = {};", read(covered, size, &address));
+    } else {
+        let value = if byte { format!("(uint8_t)ctx->r[{rd}]") } else { format!("ctx->r[{rd}]") };
+        emit!(out, "    {};", write(covered, size, &address, &value));
     }
     true
 }
