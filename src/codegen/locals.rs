@@ -334,8 +334,8 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
         }
         let guarded = blocks.guarded();
         match &rest[..word] {
-            b"CALL" | b"INTERPRET" | b"SVC" => events.push((Event::Sync, guarded)),
-            b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" => events.push((Event::Leave, guarded)),
+            b"CALL" | b"CALL_RETURNING" | b"INTERPRET" | b"SVC" => events.push((Event::Sync, guarded)),
+            b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" | b"TAIL_CALL" => events.push((Event::Leave, guarded)),
             b"JUMP_TO" => events.push((Event::Dispatch, guarded)),
             b"BLOCK" => events.push((Event::Budget, guarded)),
             b"goto" if rest.starts_with(b"goto dispatch;") => {
@@ -573,15 +573,15 @@ mod tests {
     #[test]
     fn a_call_stores_what_changed_since_the_last_sync() {
         let body = "L_00100000:\n    BLOCK(0x00100000u, 6);\n    ctx->r[4] = ctx->r[0] + 1;\n\
-            \x20   ctx->r[14] = 0x00100008u; ctx->r[15] = 0x00200000u;\n    CALL(f_00200000);\n    RETURNED(0x00100008u);\n\
-            \x20   ctx->r[0] = ctx->r[4];\n    CALL(f_00300000);\n    RETURNED(0x0010000Cu);\n\
+            \x20   ctx->r[14] = 0x00100008u; ctx->r[15] = 0x00200000u;\n    CALL_RETURNING(f_00200000, 0x00100008u);\n\
+            \x20   ctx->r[0] = ctx->r[4];\n    CALL_RETURNING(f_00300000, 0x0010000Cu);\n\
             \x20   ctx->r[15] = ctx->r[14] & ~3u; RETURN();\n    OUT_OF_BUDGET();\n";
         let kept = keep(body);
         assert_eq!(
-            sync_before(&kept, "CALL(f_00200000)"),
+            sync_before(&kept, "CALL_RETURNING(f_00200000"),
             "#define SYNC_OUT() do { ctx->r[4] = reg4_; ctx->r[14] = reg14_; ctx->r[15] = reg15_; ctx->budget = budget_; } while (0)"
         );
-        assert_eq!(sync_before(&kept, "CALL(f_00300000)"), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
+        assert_eq!(sync_before(&kept, "CALL_RETURNING(f_00300000"), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
         assert_eq!(sync_before(&kept, "RETURN();"), "#define SYNC_OUT() do { ctx->r[15] = reg15_; ctx->budget = budget_; } while (0)");
         // nothing changed yet where the budget is checked
         assert!(kept.contains("BLOCK_TO(0x00100000u, 6, out_of_budget_0);"));
@@ -603,10 +603,10 @@ mod tests {
 
     #[test]
     fn a_guarded_call_may_not_happen() {
-        let body = "    ctx->r[4] = 1;\n    if (C_EQ) {\n    CALL(f_00200000);\n    RETURNED(0x00100008u);\n    }\n\
-            \x20   ctx->r[0] = 2;\n    CALL(f_00200000);\n    RETURNED(0x0010000Cu);\n";
+        let body = "    ctx->r[4] = 1;\n    if (C_EQ) {\n    CALL_RETURNING(f_00200000, 0x00100008u);\n    }\n\
+            \x20   ctx->r[0] = 2;\n    CALL_RETURNING(f_00200000, 0x0010000Cu);\n";
         let kept = keep(body);
-        let second = kept.rfind("    CALL(f_00200000);").unwrap();
+        let second = kept.rfind("    CALL_RETURNING(f_00200000").unwrap();
         let define = kept[..second].rfind("#define SYNC_OUT() ").unwrap();
         assert_eq!(kept[define..].lines().next().unwrap(), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->r[4] = reg4_; } while (0)");
     }

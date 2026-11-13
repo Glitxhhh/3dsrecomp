@@ -31,8 +31,9 @@ Then pass the file, or a directory of them, to `build` or `port`:
 
 The files are compiled with the generated code, so everything in
 [`recomp.h`](../abi/recomp.h) is available: the context, the memory
-helpers such as `mem_read32` and `mem_write32`, and the `CALL` and
-`RETURN_TO` macros. [The interface](interface.md) describes them.
+helpers such as `mem_read32` and `mem_write32`, and the `CALL`,
+`TAIL_CALL` and `RETURN_TO` macros. [The interface](interface.md)
+describes them.
 
 An override is entered the way the guest enters the function it replaces:
 
@@ -43,7 +44,10 @@ It returns the way a guest function does:
 
 - the result goes in `r0`;
 - it ends with `RETURN_TO(ctx->r[14])`, which also switches between ARM and
-  Thumb when the caller needs it.
+  Thumb when the caller needs it, and gives back where it returned to, the
+  way every function does since version 6 of the interface. An override
+  written for version 5 or before, a `void` function, doesn't compile until
+  its returns give that back.
 
 ## Addresses
 
@@ -71,12 +75,14 @@ override can run it before or after doing something of its own:
 
 RECOMP_OVERRIDE(0x00112120) {
     fprintf(stderr, "0x00112120 called with r0 = %08X\n", ctx->r[0]);
-    CALL(RECOMP_ORIGINAL(0x00112120));
+    TAIL_CALL(RECOMP_ORIGINAL(0x00112120));
 }
 ```
 
-When the original returns, `r15` already holds the address it returned to,
-so the override can simply return too. `build` warns about an override
+`TAIL_CALL` runs the original and returns where it does. To do more after
+it, use `CALL`, which goes on when the original returns, `r15` holding
+where it returned to, and leaves the override too when the host has to take
+over. `build` warns about an override
 whose address has no generated code. There is no original to call in that
 case.
 

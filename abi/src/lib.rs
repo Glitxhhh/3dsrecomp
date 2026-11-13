@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 5;
+pub const ABI: u32 = 6;
 
 /// the oldest version code can be made for and still run: version 4 left
 /// every svc to the host's loop, and never calls Host::svc.
@@ -30,7 +30,19 @@ pub const EXIT_SVC: u32 = 1;
 pub const EXIT_BUDGET: u32 = 2;
 pub const EXIT_UNWIND: u32 = 3;
 
-pub type Code = unsafe extern "C" fn(*mut Context);
+/// runs the guest from r15, giving back where it went when it returned, as
+/// the value written to pc, or STOPPED when it left something to the host.
+/// a host goes by exit and the context, never by what comes back, which code
+/// made before version 6 doesn't give.
+pub type Code = unsafe extern "C" fn(*mut Context) -> u32;
+
+/// what code gives back when it stopped for the host.
+pub const STOPPED: u32 = u32::MAX;
+
+/// how much of the C stack the code gets below where the host enters it,
+/// which takes well over 2,048 guest calls, as deep as code of the versions
+/// before went.
+pub const STACK: usize = 1 << 20;
 
 /// where 3dsrecomp build installs libraries for hosts to find, one per
 /// title, in the system's place for a program's data.
@@ -85,6 +97,7 @@ pub struct Context {
     pub budget: i32,
     pub exit: u32,
     pub svc: u32,
+    /// what code made before version 6 counts calls in, 0 before each call.
     pub depth: u32,
     pub exclusive_address: u32,
     pub tls: u32,
@@ -94,6 +107,16 @@ pub struct Context {
     pub fpscr: *mut u32,
     pub host: *const Host,
     pub user: *mut c_void,
+    /// the lowest address the code's C stack may reach, see stack_limit.
+    pub stack_limit: usize,
+}
+
+/// a stack_limit that gives the code STACK bytes of the C stack below the
+/// caller's frame, for a host to set before each call.
+#[inline(always)]
+pub fn stack_limit() -> usize {
+    let here = 0u8;
+    (std::ptr::addr_of!(here) as usize).saturating_sub(STACK)
 }
 
 #[repr(C)]
@@ -562,7 +585,7 @@ int main(void) {
     AT(Context, budget); AT(Context, exit); AT(Context, svc); AT(Context, depth);
     AT(Context, exclusive_address); AT(Context, tls); AT(Context, read_pages);
     AT(Context, write_pages); AT(Context, vfp); AT(Context, fpscr); AT(Context, host);
-    AT(Context, user);
+    AT(Context, user); AT(Context, stack_limit);
     SIZE(Host);
     AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
     AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
@@ -580,7 +603,7 @@ int main(void) {
     AT(Origins, count); AT(Origins, piece_count); AT(Origins, pieces); AT(Origins, functions); AT(Origins, runs);
     AT(Origins, owners); AT(Origins, stale); AT(Origins, starts);
     printf("NO_ORIGIN %u\nNO_START %u\n", NO_ORIGIN, NO_START);
-    printf("RECOMP_ABI %d\n", RECOMP_ABI);
+    printf("RECOMP_ABI %d\nRECOMP_STOPPED %u\n", RECOMP_ABI, RECOMP_STOPPED);
     printf("EXIT_NONE %d\nEXIT_SVC %d\nEXIT_BUDGET %d\nEXIT_UNWIND %d\n", EXIT_NONE, EXIT_SVC, EXIT_BUDGET, EXIT_UNWIND);
     return 0;
 }
@@ -783,7 +806,7 @@ int main(void) {
 
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
-            read_pages, write_pages, vfp, fpscr, host, user);
+            read_pages, write_pages, vfp, fpscr, host, user, stack_limit);
         at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, svc);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
@@ -794,6 +817,7 @@ int main(void) {
         lines.push(format!("NO_ORIGIN {NO_ORIGIN}"));
         lines.push(format!("NO_START {NO_START}"));
         lines.push(format!("RECOMP_ABI {ABI}"));
+        lines.push(format!("RECOMP_STOPPED {STOPPED}"));
         for (name, value) in
             [("EXIT_NONE", EXIT_NONE), ("EXIT_SVC", EXIT_SVC), ("EXIT_BUDGET", EXIT_BUDGET), ("EXIT_UNWIND", EXIT_UNWIND)]
         {

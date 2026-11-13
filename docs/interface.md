@@ -5,10 +5,13 @@ depends on a particular emulator. It runs against a small interface, declared
 in [`recomp.h`](../abi/recomp.h). Any program that implements that
 interface can run the code. This document calls that program the host.
 
-This page describes version 5 of the interface. Version 4 differed only in
-the `svc` callback, which it did not have: its code left every `svc` to the
-host's loop with `EXIT_SVC`. Code made for version 4 still runs on a host
-written for 5, which `recomp_abi` accepts.
+This page describes version 6 of the interface. Version 5 differed in how
+the code makes calls: its functions returned nothing and counted how deep
+they were in `depth`, where version 6 gives back where the guest went and
+checks the C stack against `stack_limit`. Version 4 also had no `svc`
+callback: its code left every `svc` to the host's loop with `EXIT_SVC`. Code
+made for 4 and 5 still runs on a host written for 6, which `recomp_abi`
+accepts, as long as the host also sets `depth` to 0.
 
 ## What build writes
 
@@ -51,8 +54,9 @@ Zakuro does it on its own.
 
 Check `recomp_abi` first, and refuse to run the library when it is not a
 version you were written for. The version goes up whenever the layout of any
-structure or the meaning of any field changes. A host written for version 5
-can also run code made for 4, which never calls `svc`.
+structure or the meaning of any field changes. A host written for version 6
+can also run code made for 5 and 4, which give nothing back, count calls in
+`depth` and, for 4, never call `svc`.
 
 `recomp_generation` goes up when the generated code gets much faster or does
 more. Generation 3 added `recomp_origins`, generation 4, made for version 5
@@ -67,7 +71,7 @@ Building it again brings the improvements, which a host can suggest. In Rust,
 ```c
 typedef struct Entry {
     uint32_t address;
-    Code code;          /* void (*)(Context *) */
+    Code code;          /* uint32_t (*)(Context *) */
 } Entry;
 ```
 
@@ -206,13 +210,14 @@ context. The context does not need to live between two runs.
 | `budget` | How many instructions may still run. See [Budget](#budget). |
 | `exit` | Why the code returned. The host sets it to `EXIT_NONE` before each call. |
 | `svc` | The svc number, when `exit` is `EXIT_SVC`. |
-| `depth` | How many guest calls deep the C stack is. The host sets it to 0 before each call. |
+| `depth` | Where code made before version 6 counted how many guest calls deep the C stack is. A host that runs such code sets it to 0 before each call. |
 | `tls` | The read-only thread ID register, which `mrc p15, 0, rX, c13, c0, 3` reads. On the 3DS it holds the thread's TLS address. |
 | `read_pages`, `write_pages` | The page tables. See [Memory](#memory). |
 | `vfp` | 32 words, `s0` to `s31`. `dN` is `s2N` (low word) followed by `s2N+1`. |
 | `fpscr` | A pointer to FPSCR. |
 | `host` | The host's callbacks. |
 | `user` | Belongs to the host. The code never touches it. |
+| `stack_limit` | The lowest address the code's C stack may reach. The host sets it before each call, see [Calls](#calls). |
 
 `vfp` and `fpscr` are pointers so that the code and an interpreter can work on
 the same registers without copying them back and forth.
@@ -318,14 +323,15 @@ typedef struct Host {
 ## Exits
 
 When the code returns, `exit` says why, and `r[15]` and `thumb` say where
-execution continues.
+execution continues. What the code gives back is for other code, see
+[Calls](#calls), and a host can leave it alone.
 
 | `exit` | Meaning | `r[15]` |
 | --- | --- | --- |
 | `EXIT_NONE` | The guest function returned. | The return address. |
 | `EXIT_SVC` | The `svc` callback left the `svc` for the host's loop. The number is in `svc`. | The instruction after the `svc`. |
 | `EXIT_BUDGET` | The budget ran out. | The first instruction that did not run. |
-| `EXIT_UNWIND` | Anything else: an `interpret` that branched, an `svc` the host stopped the code after, a failed `lookup`, or calls nested too deep. | Where to continue. |
+| `EXIT_UNWIND` | Anything else: an `interpret` that branched, an `svc` the host stopped the code after, a failed `lookup`, or a C stack past `stack_limit`. | Where to continue. |
 
 In every case the host can go on from `r[15]`: with the code when `lookup`
 finds any, and with its interpreter otherwise, and the guest runs exactly as
@@ -338,14 +344,26 @@ ever read that one.
 
 A guest call to a function the recompiler knows becomes a C call, and a guest
 return becomes a C return. As a result, the C stack grows with the guest's call
-depth. When the depth passes `RECOMP_DEPTH_LIMIT` (2048), the code unwinds
-back to the host with `EXIT_UNWIND`. The host starts again from `r[15]` with
-`depth` at 0. Nothing is lost, because every return point is an entry.
+depth. Every function compares the C stack with `stack_limit` on its way in,
+and once the stack is past it, the code unwinds back to the host with
+`EXIT_UNWIND`, `r[15]` pointing at where the function was entered. The host
+starts again from `r[15]` with all of its stack. Nothing is lost, because
+every return point is an entry. Set `stack_limit` to the lowest address the
+code may take the stack to, far enough above the end of the stack that
+whatever the host's callbacks do below the code's frames still fits. In
+Rust, `recomp_abi::stack_limit()` gives the code `recomp_abi::STACK`, 1 MiB,
+below the caller's frame. A function's frame takes a few hundred bytes at
+most, so that is thousands of calls deep.
 
-After a call returns, the code checks that `r[15]` is the instruction after
-the call. If it is not, for example because the callee changed the return
-address or switched state, the code dispatches to wherever `r[15]` points,
-through the function's own labels or through `lookup`.
+A function gives back where the guest went when it returned, the value it
+wrote to `pc`, with bit 0 set for Thumb, or `RECOMP_STOPPED` when it left
+something to the host, which `exit` then says. A call compares that with the
+return address it put in `lr`, and goes on after the call when they are the
+same. Anything else, for example a callee that changed its return address,
+switched state or stopped, sends the caller through one place in it that
+returns too when `exit` is set, and otherwise dispatches to wherever `r[15]`
+points, through the function's own labels or through `lookup`. A jump into
+another function returns whatever that function gives back.
 
 ## Budget
 
@@ -424,8 +442,10 @@ int run(Context *ctx, int32_t budget) {
             interpret_one(ctx);
             continue;
         }
+        char here;
         ctx->exit = EXIT_NONE;
-        ctx->depth = 0;
+        /* 1 MiB of C stack for the code, below this frame */
+        ctx->stack_limit = (uintptr_t)&here - (1 << 20);
         code(ctx);
         if (ctx->exit == EXIT_SVC) return 1;
         if (ctx->exit == EXIT_BUDGET) break;

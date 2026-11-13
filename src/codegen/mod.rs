@@ -47,6 +47,11 @@ impl Scope<'_> {
         if self.relative { format!("(module_base + 0x{address:X}u)") } else { format!("0x{address:08X}u") }
     }
 
+    /// a return address as lr holds it, bit 0 set for Thumb, as C.
+    fn link(&self, link: u32) -> String {
+        if link & 1 != 0 { format!("({} | 1)", self.at(link & !1)) } else { self.at(link) }
+    }
+
     /// the C function that runs the function at target, if there is one.
     fn function(&self, target: u32, thumb: bool) -> Option<String> {
         self.functions.get(&(target | thumb as u32)).cloned()
@@ -76,17 +81,13 @@ macro_rules! emit {
 /// the caller is Thumb.
 fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) -> bool {
     let caller_thumb = link & 1 != 0;
-    let lr = if caller_thumb { format!("{} | 1", scope.at(link & !1)) } else { scope.at(link) };
+    let lr = scope.link(link);
     emit!(out, "    ctx->r[14] = {lr}; ctx->r[15] = {};", scope.at(target));
     if thumb != caller_thumb {
         emit!(out, "    ctx->thumb = {};", thumb as u8);
     }
-    match scope.function(target, thumb) {
-        Some(name) => emit!(out, "    CALL({name});"),
-        None => emit!(out, "    CALL(recomp_call);"),
-    }
-    let check = if caller_thumb { "RETURNED_T" } else { "RETURNED" };
-    emit!(out, "    {check}({});", scope.at(link & !1));
+    let callee = scope.function(target, thumb).unwrap_or_else(|| "recomp_call".to_owned());
+    emit!(out, "    CALL_RETURNING({callee}, {lr});");
     true
 }
 
@@ -135,7 +136,7 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
         emit!(out, "    goto L_{target:08X};");
     } else if let Some(name) = scope.function(target, thumb) {
         // a tail call
-        emit!(out, "    ctx->r[15] = {}; CALL({name}); RETURN();", scope.at(target));
+        emit!(out, "    ctx->r[15] = {}; TAIL_CALL({name});", scope.at(target));
     } else {
         emit!(out, "    target = {}; goto dispatch;", scope.at(target));
     }
@@ -256,10 +257,10 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             let Some(original) = names.insert(item.address, item.name.clone()) else { continue };
             let address = item.address & !1;
             let at = if unit.module.is_some() { format!("{prefix}base + 0x{address:X}u") } else { format!("0x{address:08X}u") };
-            emit!(originals, "static inline void {}(Context *ctx) {{", item.original);
+            emit!(originals, "static inline uint32_t {}(Context *ctx) {{", item.original);
             emit!(originals, "    ctx->r[15] = {at};");
             emit!(originals, "    ctx->thumb = {};", item.address & 1);
-            emit!(originals, "    {original}(ctx);");
+            emit!(originals, "    return {original}(ctx);");
             emit!(originals, "}}\n");
             original_headers.insert(header.clone());
         }
@@ -271,10 +272,10 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         emit!(prototypes, "extern RECOMP_HIDDEN uint8_t {prefix}recomp_stale[];");
         emit!(prototypes, "extern RECOMP_HIDDEN uint32_t {prefix}recomp_starts[];");
         for item in &replaced {
-            emit!(prototypes, "void {}(Context *ctx);", item.name);
+            emit!(prototypes, "uint32_t {}(Context *ctx);", item.name);
         }
         for (&entry, function) in &functions {
-            emit!(prototypes, "void {}(Context *ctx);", name(&prefix, entry, function.mode == Mode::Thumb));
+            emit!(prototypes, "uint32_t {}(Context *ctx);", name(&prefix, entry, function.mode == Mode::Thumb));
         }
         files.push((header.clone(), prototypes));
 
@@ -511,7 +512,8 @@ fn pieces(spans: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
 /// a function, the number-th of its unit.
 fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
     let thumb = function.mode == Mode::Thumb;
-    emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
+    emit!(out, "uint32_t {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
+    emit!(out, "    STACK_CHECK();");
     let mut body = String::new();
     write_body(&mut body, program, scope, entry, function, number, None);
     out.push_str(&locals::keep(&body));
@@ -556,8 +558,9 @@ fn write_body(
     emit!(out, "    }}");
     // somewhere else, the host knows where
     emit!(out, "    ctx->r[15] = target;");
-    emit!(out, "    CALL(recomp_call);");
-    emit!(out, "    RETURN();");
+    emit!(out, "    TAIL_CALL(recomp_call);");
+    // where the calls that come back anywhere else go
+    emit!(out, "    RETURNED_ELSEWHERE();");
 
     let instructions = &function.instructions;
     for (i, &address) in instructions.iter().enumerate() {
@@ -676,6 +679,195 @@ mod tests {
         compiles("svc", &files, &["code000.c"]);
     }
 
+    /// a call checks where the callee came back to with one compare against
+    /// its link, Thumb in bit 0, and every function starts by checking the
+    /// stack, and keeps one way on for the calls that came back elsewhere.
+    #[test]
+    fn calls_compare_where_the_callee_came_back_to() {
+        // bl BASE + 8, bx lr, bx lr
+        let files = generated(&[]);
+        let code = &files["code000.c"];
+        assert!(code.contains("uint32_t f_00100000(Context *ctx) {\n    STACK_CHECK();"));
+        assert!(code.contains("CALL_RETURNING(f_00100008, 0x00100004u);"));
+        assert!(code.contains("    TAIL_CALL(recomp_call);\n    RETURNED_ELSEWHERE();"));
+        assert!(!code.contains("RETURNED("));
+        assert!(files["functions.h"].contains("uint32_t f_00100008(Context *ctx);"));
+
+        // Thumb: bl BASE + 6 (two halves), bx lr, bx lr
+        let program = Program {
+            text: Segment { base: BASE, bytes: [0xF000u16, 0xF801, 0x4770, 0x4770].iter().flat_map(|h| h.to_le_bytes()).collect() },
+            seeds: vec![(BASE | 1, Source::Entry)],
+            slots: None,
+        };
+        let analysis = discover::analyze(&program);
+        let units = [Unit { module: None, program: &program, analysis: &analysis }];
+        let thumb: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
+        assert!(thumb["code000.c"].contains("CALL_RETURNING(t_00100006, (0x00100004u | 1));"), "{}", thumb["code000.c"]);
+        compiles("calls", &files, &["code000.c"]);
+        compiles("thumb-calls", &thumb, &["code000.c"]);
+    }
+
+    /// guest code run for real, through a host as small as one can be. a
+    /// callee that comes back somewhere other than its link sends the
+    /// caller on from there, and recursion deeper than the C stack the host
+    /// gives unwinds to the host, which carries on from where it stopped.
+    #[cfg(feature = "host")]
+    #[test]
+    fn calls_come_back_and_unwind() {
+        use recomp_abi::{Code, Context, Host, Library, EXIT_NONE, EXIT_UNWIND, STOPPED};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static WRONG: AtomicBool = AtomicBool::new(false);
+        // nothing should need the host but lookups
+        fn wrong() {
+            WRONG.store(true, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn read8(_: *mut Context, _: u32) -> u8 {
+            wrong();
+            0
+        }
+        unsafe extern "C" fn read16(_: *mut Context, _: u32) -> u16 {
+            wrong();
+            0
+        }
+        unsafe extern "C" fn read32(_: *mut Context, _: u32) -> u32 {
+            wrong();
+            0
+        }
+        unsafe extern "C" fn write8(_: *mut Context, _: u32, _: u8) {
+            wrong();
+        }
+        unsafe extern "C" fn write16(_: *mut Context, _: u32, _: u16) {
+            wrong();
+        }
+        unsafe extern "C" fn write32(_: *mut Context, _: u32, _: u32) {
+            wrong();
+        }
+        unsafe extern "C" fn interpret(ctx: *mut Context, _: u32, _: u32) {
+            wrong();
+            (*ctx).exit = EXIT_UNWIND;
+        }
+        unsafe extern "C" fn svc(ctx: *mut Context, _: u32) {
+            wrong();
+            (*ctx).exit = EXIT_UNWIND;
+        }
+        unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
+            (*((*ctx).user as *const Library)).lookup(address)
+        }
+        static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
+
+        let words: [u32; 18] = [
+            // f: push {lr}, mov r0, #0, bl g, add r0, r0, #1, bl h,
+            // add r0, r0, #100, pop {pc}
+            0xE52D_E004, 0xE3A0_0000, 0xEB00_0003, 0xE280_0001, 0xEB00_0003, 0xE280_0064, 0xE49D_F004,
+            // g: add lr, lr, #8, bx lr, back past f's add and bl h
+            0xE28E_E008, 0xE12F_FF1E,
+            // h: add r0, r0, #200, bx lr
+            0xE280_00C8, 0xE12F_FF1E,
+            // r: cmp r0, #0, bxeq lr, push {lr}, sub r0, r0, #1, bl r,
+            // add r1, r1, #1, pop {pc}
+            0xE350_0000, 0x012F_FF1E, 0xE52D_E004, 0xE240_0001, 0xEBFF_FFFA, 0xE281_1001, 0xE49D_F004,
+        ];
+        let program = Program {
+            text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
+            seeds: vec![(BASE, Source::Entry), (BASE + 0x2C, Source::Entry)],
+            slots: None,
+        };
+        let analysis = discover::analyze(&program);
+        let units = [Unit { module: None, program: &program, analysis: &analysis }];
+        let files = generate(&units, &[]);
+        let dir = std::env::temp_dir().join(format!("3dsrecomp-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in &files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let sources: Vec<String> = files.iter().map(|(name, _)| name.clone()).filter(|name| name.ends_with(".c")).collect();
+        let path = dir.join(recomp_abi::library_name(1));
+        let compiler = crate::compile::check(None).expect("a C compiler");
+        crate::compile::compile(&compiler, &dir, &sources, &path, &|_, _| true, false).unwrap();
+        let library = Library::open(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // the guest stack, which the code reaches directly
+        const STACK_TOP: u32 = 0x0810_0000;
+        let mut stack = vec![0u8; 0x8_0000];
+        let mut read_pages = vec![std::ptr::null_mut::<u8>(); 1 << 20];
+        for (i, page) in stack.chunks_mut(0x1000).enumerate() {
+            read_pages[(STACK_TOP as usize - 0x8_0000) / 0x1000 + i] = page.as_mut_ptr();
+        }
+        let write_pages = read_pages.clone();
+        let (mut vfp, mut fpscr) = ([0u32; 32], 0u32);
+        let mut ctx = Context {
+            r: [0; 16],
+            n: 0,
+            z: 0,
+            c: 0,
+            v: 0,
+            q: 0,
+            thumb: 0,
+            ge: 0,
+            exclusive: 0,
+            budget: 0,
+            exit: 0,
+            svc: 0,
+            depth: 0,
+            exclusive_address: 0,
+            tls: 0,
+            read_pages: read_pages.as_ptr(),
+            write_pages: write_pages.as_ptr(),
+            vfp: vfp.as_mut_ptr(),
+            fpscr: &mut fpscr,
+            host: &HOST,
+            user: &library as *const Library as *mut std::ffi::c_void,
+            stack_limit: 0,
+        };
+        // where the guest returns to the host, which no code is at
+        const DONE: u32 = 0x0020_0000;
+        // runs from r15 until the guest returns to DONE, counting how many
+        // times the host entered the code and how many of those unwound
+        let run = |ctx: &mut Context| {
+            let (mut entries, mut unwound) = (0, 0);
+            while ctx.r[15] != DONE {
+                let code = library.lookup(ctx.r[15] | ctx.thumb as u32).expect("code for r15");
+                ctx.exit = EXIT_NONE;
+                ctx.budget = i32::MAX;
+                ctx.stack_limit = recomp_abi::stack_limit();
+                // SAFETY: the code came from the library, and the context
+                // has what it needs
+                let back = unsafe { code(ctx) };
+                entries += 1;
+                match ctx.exit {
+                    EXIT_NONE => assert_eq!(back, ctx.r[15]),
+                    EXIT_UNWIND => {
+                        assert_eq!(back, STOPPED);
+                        assert_eq!(ctx.r[15], BASE + 0x2C, "unwound on the way into r");
+                        unwound += 1;
+                    }
+                    other => panic!("exit {other}"),
+                }
+            }
+            (entries, unwound)
+        };
+
+        ctx.r[13] = STACK_TOP;
+        ctx.r[14] = DONE;
+        ctx.r[15] = BASE;
+        let (entries, unwound) = run(&mut ctx);
+        // g came back past the add and the call to h
+        assert_eq!(ctx.r[0], 100);
+        assert_eq!((entries, unwound, ctx.r[13]), (1, 0, STACK_TOP));
+
+        let deep = 60_000;
+        ctx.r[0] = deep;
+        ctx.r[1] = 0;
+        ctx.r[14] = DONE;
+        ctx.r[15] = BASE + 0x2C;
+        let (entries, unwound) = run(&mut ctx);
+        assert_eq!((ctx.r[0], ctx.r[1], ctx.r[13]), (0, deep, STACK_TOP));
+        assert!(unwound >= 1 && entries > unwound, "{entries} entries, {unwound} unwound");
+        assert!(!WRONG.load(Ordering::Relaxed), "the code asked the host for more than lookups");
+    }
+
     /// compiles sources among files, in a folder of their own named after
     /// test, panicking with the compiler's complaint when they do not.
     fn compiles(test: &str, files: &BTreeMap<String, String>, sources: &[&str]) {
@@ -771,8 +963,11 @@ RECOMP_OVERRIDE(0x00100008) {
     vfp_compare(ctx, vfp_d(ctx, 1), 0.0);
     ctx->r[0] = end - start;
     if (ctx->r[0] == 0) {
+        TAIL_CALL(RECOMP_ORIGINAL(0x00100008));
+    }
+    if (ctx->r[0] == 1) {
         CALL(RECOMP_ORIGINAL(0x00100008));
-        return;
+        ctx->r[0] += 1;
     }
     RETURN_TO(ctx->r[14]);
 }
@@ -792,17 +987,17 @@ RECOMP_OVERRIDE(0x00100008) {
         };
         let files = generated(std::slice::from_ref(&replaced));
         let code = &files["code000.c"];
-        assert!(code.contains("CALL(override_0x00100008);"));
-        assert!(files["functions.h"].contains("void override_0x00100008(Context *ctx);"));
+        assert!(code.contains("CALL_RETURNING(override_0x00100008, 0x00100004u);"));
+        assert!(files["functions.h"].contains("uint32_t override_0x00100008(Context *ctx);"));
         assert!(files["entries.c"].contains("{0x00100008u, override_0x00100008},"));
         assert!(files["entries.c"].contains(&format!("recomp_generation = {}u;", recomp_abi::GENERATION)));
         let header = &files["overrides.h"];
-        assert!(header.contains("static inline void original_0x00100008(Context *ctx) {"));
-        assert!(header.contains("f_00100008(ctx);"));
+        assert!(header.contains("static inline uint32_t original_0x00100008(Context *ctx) {"));
+        assert!(header.contains("return f_00100008(ctx);"));
 
         // without overrides nothing changes
         let plain = generated(&[]);
-        assert!(plain["code000.c"].contains("CALL(f_00100008);"));
+        assert!(plain["code000.c"].contains("CALL_RETURNING(f_00100008, 0x00100004u);"));
         assert!(!plain.contains_key("overrides.h"));
     }
 }

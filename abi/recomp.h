@@ -7,10 +7,17 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 5
+#define RECOMP_ABI 6
 
 typedef struct Context Context;
-typedef void (*Code)(Context *);
+/* runs the guest from r15 and gives back where it went when it returned,
+   the way the value was written to pc, Thumb in bit 0, or RECOMP_STOPPED
+   when it left something to the host, which exit says. */
+typedef uint32_t (*Code)(Context *);
+
+/* what code gives back when it stopped for the host rather than returning,
+   an address no code returns to, odd and past everything. */
+#define RECOMP_STOPPED 0xFFFFFFFFu
 
 typedef struct Host {
     uint8_t (*read8)(Context *, uint32_t);
@@ -51,6 +58,8 @@ struct Context {
     int32_t budget;
     uint32_t exit;
     uint32_t svc;
+    /* what code made before version 6 counted calls in, which the host sets
+       to 0 before each call. */
     uint32_t depth;
     uint32_t exclusive_address;
     /* the read-only thread id register, which holds the thread's TLS
@@ -66,6 +75,9 @@ struct Context {
     uint32_t *fpscr;
     const Host *host;
     void *user;
+    /* the lowest address the code's C stack may reach, which a function
+       checks on its way in, unwinding when it is past it. */
+    uintptr_t stack_limit;
 };
 
 typedef struct Entry {
@@ -628,7 +640,30 @@ static void vfp_vector(Context *ctx, int op, int wide, int d, int n, int m) {
     }
 }
 
-#define RECOMP_DEPTH_LIMIT 2048
+/* where the C stack is, which a generated function compares with the
+   context's stack_limit on its way in. */
+#if defined(__x86_64__)
+static ALWAYS_INLINE uintptr_t recomp_stack(void) {
+    uintptr_t sp;
+    __asm__("movq %%rsp, %0" : "=r"(sp));
+    return sp;
+}
+#elif defined(__aarch64__)
+static ALWAYS_INLINE uintptr_t recomp_stack(void) {
+    uintptr_t sp;
+    __asm__("mov %0, sp" : "=r"(sp));
+    return sp;
+}
+#else
+#define recomp_stack() ((uintptr_t)__builtin_frame_address(0))
+#endif
+
+/* the first thing a generated function does: when the C stack is past the
+   limit the host gave, it unwinds. every way in can, with r15 where it was
+   entered and the context complete, and the host starts again from there
+   with all of its stack. */
+#define STACK_CHECK() \
+    if (UNLIKELY(recomp_stack() < ctx->stack_limit)) { ctx->exit = EXIT_UNWIND; return RECOMP_STOPPED; }
 
 /* a generated function keeps the registers and flags it uses in locals,
    which the compiler can hold in host registers. SYNC_OUT puts them back in
@@ -638,44 +673,61 @@ static void vfp_vector(Context *ctx, int op, int wide, int d, int n, int m) {
 #define SYNC_OUT() do { } while (0)
 #define SYNC_IN() do { } while (0)
 
-/* leaving the function, with the registers where the caller finds them. */
-#define RETURN() do { SYNC_OUT(); return; } while (0)
+/* leaving the function, with the registers where the caller finds them,
+   and where to as the caller checks it. */
+#define RETURN() do { SYNC_OUT(); return ctx->r[15] | ctx->thumb; } while (0)
 
 /* a short vector works on the VFP registers in the context. */
 #define VFP_VECTOR(c, ...) do { SYNC_OUT(); vfp_vector((c), __VA_ARGS__); SYNC_IN(); } while (0)
 
-/* a guest call, leaving the caller too when the host has to take over. */
+/* a guest call from code written by hand, leaving the caller too when the
+   host has to take over, and going on after it wherever the callee
+   returned to. */
 #define CALL(code) do { \
     SYNC_OUT(); \
-    if (UNLIKELY(++ctx->depth > RECOMP_DEPTH_LIMIT)) { ctx->depth--; ctx->exit = EXIT_UNWIND; return; } \
-    code(ctx); \
-    ctx->depth--; \
-    if (UNLIKELY(ctx->exit)) return; \
+    if (UNLIKELY((code)(ctx) == RECOMP_STOPPED)) return RECOMP_STOPPED; \
     SYNC_IN(); \
 } while (0)
 
+/* a guest call in generated code, which goes on after it when the callee
+   comes back to link, the return address as lr holds it, Thumb in bit 0.
+   anything else, the host taking over too, goes to the function's one
+   RETURNED_ELSEWHERE, so that a call is no more than the compare. */
+#define CALL_RETURNING(code, link) do { \
+    SYNC_OUT(); \
+    if (UNLIKELY((code)(ctx) != (link))) goto returned_elsewhere; \
+    SYNC_IN(); \
+} while (0)
+
+/* where a call that came back anywhere but its link goes: up to the host
+   when it stopped, and on from where the guest is otherwise, through
+   dispatch, the locals taken from the context again. */
+#define RETURNED_ELSEWHERE() \
+    returned_elsewhere: \
+    if (ctx->exit) return RECOMP_STOPPED; \
+    SYNC_IN(); \
+    target = ctx->r[15]; \
+    goto dispatch
+
+/* a jump into other code, which returns where that code does. */
+#define TAIL_CALL(code) do { SYNC_OUT(); return (code)(ctx); } while (0)
+
 /* runs whatever code the host has for r15. */
-static inline void recomp_call(Context *ctx) {
+static inline uint32_t recomp_call(Context *ctx) {
     Code code = ctx->host->lookup(ctx, ctx->r[15] | ctx->thumb);
-    if (code) code(ctx);
-    else ctx->exit = EXIT_UNWIND;
+    if (LIKELY(code)) return code(ctx);
+    ctx->exit = EXIT_UNWIND;
+    return RECOMP_STOPPED;
 }
 
-/* after a call, anything but a plain return to the next instruction goes
-   through dispatch. */
-#define RETURNED(address) \
-    if (UNLIKELY(ctx->r[15] != (address) || ctx->thumb)) { target = ctx->r[15]; goto dispatch; }
-
-#define RETURNED_T(address) \
-    if (UNLIKELY(ctx->r[15] != (address) || !ctx->thumb)) { target = ctx->r[15]; goto dispatch; }
-
-/* a return that may switch to Thumb. */
+/* a return that may switch to Thumb, giving back the value written to pc,
+   which says where to and in which state. */
 #define RETURN_TO(value) do { \
     uint32_t v_ = (value); \
     SYNC_OUT(); \
     ctx->thumb = v_ & 1; \
     ctx->r[15] = v_ & (ctx->thumb ? ~1u : ~3u); \
-    return; \
+    return v_; \
 } while (0)
 
 /* the same from ARM code, where thumb is 0 already, and from Thumb code,
@@ -685,7 +737,7 @@ static inline void recomp_call(Context *ctx) {
     SYNC_OUT(); \
     if (UNLIKELY(v_ & 1)) { ctx->thumb = 1; ctx->r[15] = v_ & ~1u; } \
     else ctx->r[15] = v_ & ~3u; \
-    return; \
+    return v_; \
 } while (0)
 
 #define RETURN_TO_T(value) do { \
@@ -693,7 +745,7 @@ static inline void recomp_call(Context *ctx) {
     SYNC_OUT(); \
     if (UNLIKELY(!(v_ & 1))) { ctx->thumb = 0; ctx->r[15] = v_ & ~3u; } \
     else ctx->r[15] = v_ & ~1u; \
-    return; \
+    return v_; \
 } while (0)
 
 /* a jump that may switch to Thumb. dispatch can lead anywhere, so the
@@ -719,7 +771,7 @@ static inline void recomp_call(Context *ctx) {
         SYNC_OUT(); \
         ctx->r[15] = (address); \
         ctx->exit = EXIT_BUDGET; \
-        return; \
+        return RECOMP_STOPPED; \
     }
 
 /* the same at the start of each block of generated code, where the blocks
@@ -740,7 +792,7 @@ static inline void recomp_call(Context *ctx) {
     SYNC_OUT(); \
     ctx->r[15] = resume; \
     ctx->exit = EXIT_BUDGET; \
-    return
+    return RECOMP_STOPPED
 
 #define OUT_OF_BUDGET() OUT_OF_BUDGET_AT(out_of_budget)
 
@@ -750,14 +802,14 @@ static inline void recomp_call(Context *ctx) {
     SYNC_OUT(); \
     ctx->r[15] = (next); \
     ctx->host->svc(ctx, (number)); \
-    if (UNLIKELY(ctx->exit)) return; \
+    if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
     SYNC_IN(); \
 } while (0)
 
 #define INTERPRET(address, opcode) do { \
     SYNC_OUT(); \
     ctx->host->interpret(ctx, (address), (opcode)); \
-    if (UNLIKELY(ctx->exit)) return; \
+    if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
     SYNC_IN(); \
 } while (0)
 
@@ -766,7 +818,7 @@ static inline void recomp_call(Context *ctx) {
    was entered at, which r15 holds, for the host to run some other way. its
    registers only went into locals, nothing has to be put back. */
 #define STALE_CHECK(flag) \
-    if (UNLIKELY(flag)) { ctx->exit = EXIT_UNWIND; return; }
+    if (UNLIKELY(flag)) { ctx->exit = EXIT_UNWIND; return RECOMP_STOPPED; }
 
 /* the C library's integer divisions, which natives.c runs on the host in
    place of the title's copies of them, see src/natives.rs. each first checks
@@ -897,7 +949,8 @@ static ALWAYS_INLINE int32_t native_ldivmod_cost(const Context *ctx) {
     return 20 + native_uldivmod_cost_of(un, ud);
 }
 
-/* an override running a native, falling back on the original. */
+/* an override running a native, falling back on the original, whose return
+   it gives back. */
 #define RECOMP_NATIVE(address, name, original) do { \
     if (LIKELY(recomp_natives) && native_##name##_fits(ctx)) { \
         int32_t cost_ = native_##name##_cost(ctx); \
@@ -907,15 +960,16 @@ static ALWAYS_INLINE int32_t native_ldivmod_cost(const Context *ctx) {
             RETURN_TO(ctx->r[14]); \
         } \
     } \
-    CALL(original); \
+    return (original)(ctx); \
 } while (0)
 
 /* a function written by hand to run instead of the one at address, odd for
    Thumb, or at an offset in a module. see docs/overrides.md. */
-#define RECOMP_OVERRIDE(address) void override_##address(Context *ctx)
-#define RECOMP_OVERRIDE_IN(module, offset) void override_##module##_##offset(Context *ctx)
+#define RECOMP_OVERRIDE(address) uint32_t override_##address(Context *ctx)
+#define RECOMP_OVERRIDE_IN(module, offset) uint32_t override_##module##_##offset(Context *ctx)
 
-/* the generated function an override replaces, to run with CALL. */
+/* the generated function an override replaces, to run with CALL or
+   TAIL_CALL. */
 #define RECOMP_ORIGINAL(address) original_##address
 #define RECOMP_ORIGINAL_IN(module, offset) original_##module##_##offset
 

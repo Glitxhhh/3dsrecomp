@@ -341,6 +341,7 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
                 (*ctx).budget = budget;
                 (*ctx).exit = abi::EXIT_NONE;
                 (*ctx).depth = 0;
+                (*ctx).stack_limit = abi::stack_limit();
                 code(ctx);
                 let spent = budget - (*ctx).budget;
                 left -= spent;
@@ -509,6 +510,7 @@ fn context(run: &mut Run) -> Context {
         fpscr: &mut run.cpu.vfp.fpscr,
         host: &HOST,
         user: run as *mut Run as *mut c_void,
+        stack_limit: 0,
     }
 }
 

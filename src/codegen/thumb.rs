@@ -220,8 +220,7 @@ fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
                 "    {{ uint32_t v = {source}; ctx->r[14] = {} | 1; ctx->thumb = v & 1; ctx->r[15] = v & (ctx->thumb ? ~1u : ~3u); }}",
                 scope.at(next)
             );
-            emit!(out, "    CALL(recomp_call);");
-            emit!(out, "    RETURNED_T({});", scope.at(next));
+            emit!(out, "    CALL_RETURNING(recomp_call, {});", scope.link(next | 1));
             true
         }
         _ if rs == 14 => {

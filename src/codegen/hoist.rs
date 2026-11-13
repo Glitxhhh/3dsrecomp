@@ -53,7 +53,8 @@ const MOST: i64 = 512;
 /// the words in the C of an instruction that hand control to the host or to
 /// other code, which can do anything to the page tables, and after which the
 /// locals are read again.
-const TURNS: &[&str] = &["CALL(", "SVC(", "INTERPRET(", "RETURN", "JUMP_TO(", "VFP_VECTOR(", "OUT_OF_BUDGET", "SYNC_"];
+const TURNS: &[&str] =
+    &["CALL(", "CALL_RETURNING(", "SVC(", "INTERPRET(", "RETURN", "JUMP_TO(", "VFP_VECTOR(", "OUT_OF_BUDGET", "SYNC_"];
 
 /// whether an instruction's C lets the host or other code run.
 fn turns(text: &str) -> bool {
