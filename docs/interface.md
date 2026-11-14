@@ -5,13 +5,16 @@ depends on a particular emulator. It runs against a small interface, declared
 in [`recomp.h`](../abi/recomp.h). Any program that implements that
 interface can run the code. This document calls that program the host.
 
-This page describes version 6 of the interface. Version 5 differed in how
-the code makes calls: its functions returned nothing and counted how deep
-they were in `depth`, where version 6 gives back where the guest went and
-checks the C stack against `stack_limit`. Version 4 also had no `svc`
+This page describes version 7 of the interface. Version 6 had no `tick_`
+fields: its code asked the host for every GetSystemTick, where version 7
+code can read the clock itself, see [Ticks](#ticks). Version 5 differed in
+how the code makes calls: its functions returned nothing and counted how
+deep they were in `depth`, where version 6 gives back where the guest went
+and checks the C stack against `stack_limit`. Version 4 also had no `svc`
 callback: its code left every `svc` to the host's loop with `EXIT_SVC`. Code
-made for 4 and 5 still runs on a host written for 6, which `recomp_abi`
-accepts, as long as the host also sets `depth` to 0.
+made for 4, 5 and 6 still runs on a host written for 7, which `recomp_abi`
+accepts, as long as the host also sets `depth` to 0. Such code never reads
+the `tick_` fields.
 
 ## What build writes
 
@@ -54,9 +57,10 @@ Zakuro does it on its own.
 
 Check `recomp_abi` first, and refuse to run the library when it is not a
 version you were written for. The version goes up whenever the layout of any
-structure or the meaning of any field changes. A host written for version 6
-can also run code made for 5 and 4, which give nothing back, count calls in
-`depth` and, for 4, never call `svc`.
+structure or the meaning of any field changes. A host written for version 7
+can also run code made for 6, 5 and 4, which ask for every tick, and for 5
+and 4 give nothing back and count calls in `depth`, and for 4 never call
+`svc`.
 
 `recomp_generation` goes up when the generated code gets much faster or does
 more. Generation 3 added `recomp_origins`, generation 4, made for version 5
@@ -218,6 +222,8 @@ context. The context does not need to live between two runs.
 | `host` | The host's callbacks. |
 | `user` | Belongs to the host. The code never touches it. |
 | `stack_limit` | The lowest address the code's C stack may reach. The host sets it before each call, see [Calls](#calls). |
+| `tick_end`, `tick_floor`, `tick_cost`, `tick_at` | Where and how the code may answer GetSystemTick itself, see [Ticks](#ticks). A host that never sets `tick_at` gets every one through `svc`. |
+| `ticks`, `tick_last` | How many ticks the code answered, and the last one it gave. |
 
 `vfp` and `fpscr` are pointers so that the code and an interpreter can work on
 the same registers without copying them back and forth.
@@ -319,6 +325,47 @@ typedef struct Host {
   Running it in place saves the code from returning all the way out and
   being entered again, which titles that read the clock or take a lock
   thousands of times a frame pay for each time.
+
+## Ticks
+
+Titles read the clock with `svc 0x28`, GetSystemTick, more than they make any
+other svc. From version 7 the code can answer it without calling the host,
+as long as the clock goes up with the budget, the way it does in a host
+that counts the budget in cycles. The code answers one when both hold:
+
+- `tick_at` is the address after the `svc`, with bit 0 set for Thumb. The
+  host names one place at a time, 0 naming none;
+- `budget` is greater than `tick_floor`, before the tick is paid for.
+
+Then the tick is `tick_end - budget`, as 64 bits, in `r0` (low) and `r1`
+(high). The code takes `tick_cost` from `budget`, adds one to `ticks` and
+leaves the tick in `tick_last`. It sets `r[15]` past the `svc` and goes on
+without calling anything. The host finds out from `ticks` when the code
+next calls `svc` or `interpret`, or returns, and sets it back to 0 then.
+Anywhere else, or with the budget at the floor, the code calls `svc` with
+`0x28` as for any svc.
+
+A host that runs GetSystemTick in place can work the fields out from what
+it would do there:
+
+- `tick_end` is the cycle count at which the budget runs out, so that
+  `tick_end - budget` is the cycle count now;
+- `tick_floor` keeps the code off ticks after which the host would do
+  more than read the clock, an event coming due, say. If the host's next
+  such point is at cycle `due`, a tick at cycle `t` stays clear of it when
+  `t + tick_cost < due`, which is `budget > tick_end + tick_cost - due`;
+- `tick_at` is a place the host has seen GetSystemTick at and answered
+  itself, the one the code goes back to over and over. Naming only one at
+  a time lets the host account for the ticks the code answered: they all
+  came from there, in a row;
+- a host with anything to do for a tick, a history of where the guest
+  was say, does it for `ticks` of them before it handles the callback the
+  code made, or what the code returned for.
+
+The host sets `tick_end` and `tick_floor` again whenever it changes
+`budget` or what the floor depends on, as it does after an svc it ran in
+place, and `tick_at` whenever that stops being a place it would answer at.
+Setting `tick_at` to 0 is always enough.
 
 ## Exits
 

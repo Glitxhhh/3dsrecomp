@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 6;
+pub const ABI: u32 = 7;
 
 /// the oldest version code can be made for and still run: version 4 left
 /// every svc to the host's loop, and never calls Host::svc.
@@ -109,7 +109,21 @@ pub struct Context {
     pub user: *mut c_void,
     /// the lowest address the code's C stack may reach, see stack_limit.
     pub stack_limit: usize,
+    /// from version 7, GetSystemTick the code answers itself: tick_end
+    /// less the budget, costing tick_cost of it, only at tick_at, the
+    /// address after the svc with bit 0 set for Thumb, while the budget is
+    /// above tick_floor. it counts them in ticks and leaves the last tick
+    /// in tick_last. NO_TICKS has every one go through Host::svc.
+    pub tick_end: u64,
+    pub tick_last: u64,
+    pub tick_floor: i32,
+    pub tick_cost: i32,
+    pub tick_at: u32,
+    pub ticks: u32,
 }
+
+/// a tick_at no code answers GetSystemTick at.
+pub const NO_TICKS: u32 = 0;
 
 /// a stack_limit that gives the code STACK bytes of the C stack below the
 /// caller's frame, for a host to set before each call.
@@ -585,7 +599,8 @@ int main(void) {
     AT(Context, budget); AT(Context, exit); AT(Context, svc); AT(Context, depth);
     AT(Context, exclusive_address); AT(Context, tls); AT(Context, read_pages);
     AT(Context, write_pages); AT(Context, vfp); AT(Context, fpscr); AT(Context, host);
-    AT(Context, user); AT(Context, stack_limit);
+    AT(Context, user); AT(Context, stack_limit); AT(Context, tick_end); AT(Context, tick_last);
+    AT(Context, tick_floor); AT(Context, tick_cost); AT(Context, tick_at); AT(Context, ticks);
     SIZE(Host);
     AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
     AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
@@ -806,7 +821,7 @@ int main(void) {
 
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
-            read_pages, write_pages, vfp, fpscr, host, user, stack_limit);
+            read_pages, write_pages, vfp, fpscr, host, user, stack_limit, tick_end, tick_last, tick_floor, tick_cost, tick_at, ticks);
         at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, svc);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);

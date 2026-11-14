@@ -60,9 +60,13 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
         0b110 => vfp::load_store(out, scope, a, op),
-        // the host runs an svc in place, and the code goes on after it
+        // the host runs an svc in place, and the code goes on after it,
+        // the code reading the clock itself where the host lets it
         0b111 if op & (1 << 24) != 0 => {
-            emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), op & 0x00FF_FFFF);
+            match op & 0x00FF_FFFF {
+                0x28 => emit!(out, "    SVC_TICK({}, 0u);", scope.at(a + 4)),
+                number => emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), number),
+            }
             true
         }
         0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),

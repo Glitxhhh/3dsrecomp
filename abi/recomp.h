@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 6
+#define RECOMP_ABI 7
 
 typedef struct Context Context;
 /* runs the guest from r15 and gives back where it went when it returned,
@@ -78,6 +78,18 @@ struct Context {
     /* the lowest address the code's C stack may reach, which a function
        checks on its way in, unwinding when it is past it. */
     uintptr_t stack_limit;
+    /* from version 7, GetSystemTick the code answers itself, see SVC_TICK:
+       the tick is tick_end less the budget, and costs tick_cost of it. the
+       code answers only at tick_at, the address after the svc with bit 0
+       set for Thumb, while the budget is above tick_floor, counting each in
+       ticks and leaving the last tick in tick_last. a host that never sets
+       tick_at gets every one through svc. */
+    uint64_t tick_end;
+    uint64_t tick_last;
+    int32_t tick_floor;
+    int32_t tick_cost;
+    uint32_t tick_at;
+    uint32_t ticks;
 };
 
 typedef struct Entry {
@@ -803,6 +815,26 @@ static inline uint32_t recomp_call(Context *ctx) {
     ctx->r[15] = (next); \
     ctx->host->svc(ctx, (number)); \
     if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
+    SYNC_IN(); \
+} while (0)
+
+/* svc 0x28, GetSystemTick, which the code answers itself where the host
+   lets it, thumb 1 for Thumb code, see Context. anywhere else it is an svc
+   like the others. */
+#define SVC_TICK(next, thumb) do { \
+    SYNC_OUT(); \
+    ctx->r[15] = (next); \
+    if (LIKELY(ctx->tick_at == ((next) | (thumb))) && LIKELY(ctx->budget > ctx->tick_floor)) { \
+        uint64_t tick_ = ctx->tick_end - (uint64_t)(int64_t)ctx->budget; \
+        ctx->budget -= ctx->tick_cost; \
+        ctx->tick_last = tick_; \
+        ctx->ticks += 1; \
+        ctx->r[0] = (uint32_t)tick_; \
+        ctx->r[1] = (uint32_t)(tick_ >> 32); \
+    } else { \
+        ctx->host->svc(ctx, 0x28u); \
+        if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
+    } \
     SYNC_IN(); \
 } while (0)
 

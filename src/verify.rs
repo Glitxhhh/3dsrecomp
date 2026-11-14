@@ -511,6 +511,12 @@ fn context(run: &mut Run) -> Context {
         host: &HOST,
         user: run as *mut Run as *mut c_void,
         stack_limit: 0,
+        tick_end: 0,
+        tick_last: 0,
+        tick_floor: i32::MAX,
+        tick_cost: 0,
+        tick_at: abi::NO_TICKS,
+        ticks: 0,
     }
 }
 

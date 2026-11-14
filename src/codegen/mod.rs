@@ -665,18 +665,31 @@ mod tests {
 
     /// the code goes on after an svc, which the host ran, into the next
     /// instruction, where the host comes back in when it stops instead.
+    /// GetSystemTick is one the code can answer itself.
     #[test]
     fn an_svc_goes_on_to_the_next_instruction() {
-        // svceq 0x28, svc 0x28, bx lr
-        let files = files(&[0x0F00_0028, 0xEF00_0028, 0xE12F_FF1E], &[]);
+        // svceq 0x28, svc 0x14, bx lr
+        let files = files(&[0x0F00_0028, 0xEF00_0014, 0xE12F_FF1E], &[]);
         let code = &files["code000.c"];
-        let conditional = code.find("SVC(0x00100004u, 0x28u);").expect("the first svc");
-        let svc = code.find("SVC(0x00100008u, 0x28u);").expect("the second svc");
+        let conditional = code.find("SVC_TICK(0x00100004u, 0u);").expect("the first svc");
+        let svc = code.find("SVC(0x00100008u, 0x14u);").expect("the second svc");
         let next = code.find("L_00100008:").expect("a label after it");
         assert!(conditional < svc && svc < next);
         assert!(!code[svc..next].contains("goto"), "{}", &code[svc..next]);
 
+        // Thumb: svc 0x28, bx lr
+        let program = Program {
+            text: Segment { base: BASE, bytes: [0xDF28u16, 0x4770].iter().flat_map(|h| h.to_le_bytes()).collect() },
+            seeds: vec![(BASE | 1, Source::Entry)],
+            slots: None,
+        };
+        let analysis = discover::analyze(&program);
+        let units = [Unit { module: None, program: &program, analysis: &analysis }];
+        let thumb: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
+        assert!(thumb["code000.c"].contains("SVC_TICK(0x00100002u, 1u);"), "{}", thumb["code000.c"]);
+
         compiles("svc", &files, &["code000.c"]);
+        compiles("thumb-svc", &thumb, &["code000.c"]);
     }
 
     /// a call checks where the callee came back to with one compare against
@@ -773,20 +786,7 @@ mod tests {
             seeds: vec![(BASE, Source::Entry), (BASE + 0x2C, Source::Entry)],
             slots: None,
         };
-        let analysis = discover::analyze(&program);
-        let units = [Unit { module: None, program: &program, analysis: &analysis }];
-        let files = generate(&units, &[]);
-        let dir = std::env::temp_dir().join(format!("3dsrecomp-run-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, text) in &files {
-            std::fs::write(dir.join(name), text).unwrap();
-        }
-        let sources: Vec<String> = files.iter().map(|(name, _)| name.clone()).filter(|name| name.ends_with(".c")).collect();
-        let path = dir.join(recomp_abi::library_name(1));
-        let compiler = crate::compile::check(None).expect("a C compiler");
-        crate::compile::compile(&compiler, &dir, &sources, &path, &|_, _| true, false).unwrap();
-        let library = Library::open(&path).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
+        let library = library("run", &program);
 
         // the guest stack, which the code reaches directly
         const STACK_TOP: u32 = 0x0810_0000;
@@ -820,6 +820,12 @@ mod tests {
             host: &HOST,
             user: &library as *const Library as *mut std::ffi::c_void,
             stack_limit: 0,
+            tick_end: 0,
+            tick_last: 0,
+            tick_floor: i32::MAX,
+            tick_cost: 0,
+            tick_at: recomp_abi::NO_TICKS,
+            ticks: 0,
         };
         // where the guest returns to the host, which no code is at
         const DONE: u32 = 0x0020_0000;
@@ -866,6 +872,128 @@ mod tests {
         assert_eq!((ctx.r[0], ctx.r[1], ctx.r[13]), (0, deep, STACK_TOP));
         assert!(unwound >= 1 && entries > unwound, "{entries} entries, {unwound} unwound");
         assert!(!WRONG.load(Ordering::Relaxed), "the code asked the host for more than lookups");
+    }
+
+    /// the code for program, built and loaded, in a folder named after test
+    /// while it builds.
+    #[cfg(feature = "host")]
+    fn library(test: &str, program: &Program) -> recomp_abi::Library {
+        let analysis = discover::analyze(program);
+        let units = [Unit { module: None, program, analysis: &analysis }];
+        let files = generate(&units, &[]);
+        let dir = std::env::temp_dir().join(format!("3dsrecomp-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in &files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let sources: Vec<String> = files.iter().map(|(name, _)| name.clone()).filter(|name| name.ends_with(".c")).collect();
+        let path = dir.join(recomp_abi::library_name(1));
+        let compiler = crate::compile::check(None).expect("a C compiler");
+        crate::compile::compile(&compiler, &dir, &sources, &path, &|_, _| true, false).unwrap();
+        let library = recomp_abi::Library::open(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        library
+    }
+
+    /// GetSystemTick run for real: the code answers it itself at the one
+    /// place the host lets it, while the budget is above the floor, and the
+    /// host answers the rest.
+    #[cfg(feature = "host")]
+    #[test]
+    fn the_code_reads_the_clock_where_the_host_lets_it() {
+        use recomp_abi::{Code, Context, Host, Library, EXIT_NONE};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static ASKED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn read8(_: *mut Context, _: u32) -> u8 {
+            0
+        }
+        unsafe extern "C" fn read16(_: *mut Context, _: u32) -> u16 {
+            0
+        }
+        unsafe extern "C" fn read32(_: *mut Context, _: u32) -> u32 {
+            0
+        }
+        unsafe extern "C" fn write8(_: *mut Context, _: u32, _: u8) {}
+        unsafe extern "C" fn write16(_: *mut Context, _: u32, _: u16) {}
+        unsafe extern "C" fn write32(_: *mut Context, _: u32, _: u32) {}
+        unsafe extern "C" fn interpret(_: *mut Context, _: u32, _: u32) {}
+        // the host's tick, which the code's never is
+        unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
+            assert_eq!(number, 0x28);
+            ASKED.fetch_add(1, Ordering::Relaxed);
+            (*ctx).r[0] = 7;
+            (*ctx).r[1] = 0;
+        }
+        unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
+            (*((*ctx).user as *const Library)).lookup(address)
+        }
+        static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
+
+        // svc 0x28, mov r2, r0, svc 0x28, bx lr
+        let words = [0xEF00_0028u32, 0xE1A0_2000, 0xEF00_0028, 0xE12F_FF1E];
+        let program = Program {
+            text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
+            seeds: vec![(BASE, Source::Entry)],
+            slots: None,
+        };
+        let library = library("ticks", &program);
+        let (mut vfp, mut fpscr) = ([0u32; 32], 0u32);
+        let pages = vec![std::ptr::null_mut::<u8>(); 1 << 20];
+        let mut ctx = Context {
+            r: [0; 16],
+            n: 0,
+            z: 0,
+            c: 0,
+            v: 0,
+            q: 0,
+            thumb: 0,
+            ge: 0,
+            exclusive: 0,
+            budget: 0,
+            exit: 0,
+            svc: 0,
+            depth: 0,
+            exclusive_address: 0,
+            tls: 0,
+            read_pages: pages.as_ptr(),
+            write_pages: pages.as_ptr(),
+            vfp: vfp.as_mut_ptr(),
+            fpscr: &mut fpscr,
+            host: &HOST,
+            user: &library as *const Library as *mut std::ffi::c_void,
+            stack_limit: 0,
+            tick_end: 1000,
+            tick_last: 0,
+            tick_floor: 10,
+            tick_cost: 150,
+            tick_at: BASE + 4,
+            ticks: 0,
+        };
+        let run = |ctx: &mut Context, floor: i32| {
+            ASKED.store(0, Ordering::Relaxed);
+            (ctx.r[14], ctx.r[15], ctx.budget, ctx.ticks, ctx.tick_floor) = (0x0020_0000, BASE, 500, 0, floor);
+            ctx.exit = EXIT_NONE;
+            ctx.stack_limit = recomp_abi::stack_limit();
+            let code = library.lookup(BASE).expect("code for the program");
+            // SAFETY: the code came from the library, and the context has
+            // what it needs
+            let back = unsafe { code(ctx) };
+            assert_eq!((back, ctx.exit), (0x0020_0000, EXIT_NONE));
+            ASKED.load(Ordering::Relaxed)
+        };
+
+        // the first is the code's, the clock less the budget, the second the
+        // host's, the address after it not the one the host named
+        assert_eq!(run(&mut ctx, 10), 1);
+        assert_eq!((ctx.r[0], ctx.ticks), (7, 1));
+        assert_eq!(ctx.r[2] as u64, ctx.tick_last);
+        assert!((1000 - 500..=1000 - 496).contains(&ctx.tick_last), "{}", ctx.tick_last);
+        assert_eq!(ctx.budget, 500 - 4 - 150, "four instructions and a tick");
+
+        // with the budget at or below the floor the host answers both
+        assert_eq!(run(&mut ctx, 500), 2);
+        assert_eq!((ctx.r[0], ctx.r[2], ctx.ticks, ctx.budget), (7, 7, 0, 500 - 4));
     }
 
     /// compiles sources among files, in a folder of their own named after
