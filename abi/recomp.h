@@ -886,8 +886,16 @@ static ALWAYS_INLINE void native_idivmod(Context *ctx, uint32_t address) {
     ctx->r[1] = (uint32_t)(n % d);
 }
 
+/* a register pair as 64 bits, low first, read as the two words they are.
+   compilers make one load of the two otherwise, which has to wait for the
+   two stores the caller made just before to reach the cache, where each of
+   two loads takes what one store holds. */
 static ALWAYS_INLINE uint64_t native_pair(const Context *ctx, int low) {
-    return ctx->r[low] | (uint64_t)ctx->r[low + 1] << 32;
+    uint32_t lo = ctx->r[low], hi = ctx->r[low + 1];
+#if defined(__GNUC__)
+    __asm__("" : "+r"(lo), "+r"(hi));
+#endif
+    return lo | (uint64_t)hi << 32;
 }
 
 static ALWAYS_INLINE void native_set_pair(Context *ctx, int low, uint64_t value) {
@@ -899,12 +907,14 @@ static ALWAYS_INLINE int native_uldivmod_fits(const Context *ctx) {
     return native_pair(ctx, 2) != 0;
 }
 
-/* what _ll_udiv pushes on its way in, push {r4, r5, r6, lr}, r4 as given. */
+/* what _ll_udiv pushes on its way in, push {r4, r5, r6, lr}, r4 as given,
+   with one look at the page for the four. */
 static ALWAYS_INLINE void native_push_ll_udiv(Context *ctx, uint32_t sp, uint32_t r4, uint32_t lr) {
-    mem_write32(ctx, sp - 16, r4);
-    mem_write32(ctx, sp - 12, ctx->r[5]);
-    mem_write32(ctx, sp - 8, ctx->r[6]);
-    mem_write32(ctx, sp - 4, lr);
+    uint8_t *span = mem_write_span(ctx, sp - 16, 16);
+    SPAN_WRITE32(span, 0, sp - 16, r4);
+    SPAN_WRITE32(span, 4, sp - 12, ctx->r[5]);
+    SPAN_WRITE32(span, 8, sp - 8, ctx->r[6]);
+    SPAN_WRITE32(span, 12, sp - 4, lr);
 }
 
 static ALWAYS_INLINE void native_uldivmod(Context *ctx, uint32_t address) {
